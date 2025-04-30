@@ -89,18 +89,19 @@ class GameState:
         numbers = [2,3,3,4,4,5,5,6,6,8,8,9,9,10,10,11,11,12]
         rd.shuffle(numbers)
         
-        # Correct spiral order including all 19 tiles
         spiral_order = [0,1,2,7,12,17,18,13,8,3,4,9,14,16,15,10,5,6,11]
         centers = board_positions(SIZE)
         
         self.tiles = []
         number_idx = 0
+        desert_placed = False
+        
         for idx in spiral_order:
             res = resources.pop()
             pos = centers[idx]
-            if res == "desert":
+            if res == "desert" and not desert_placed:
                 self.tiles.append((res, None, pos))
-                numbers.insert(6, None)  # Insert desert at position 6
+                desert_placed = True
             else:
                 self.tiles.append((res, numbers[number_idx], pos))
                 number_idx += 1
@@ -134,7 +135,6 @@ class GameState:
                     self.phase = "regular"
                     self.current_player_idx = 0
                     self.distribute_initial_resources()
-            # Reset placement flags
             self.current_player.placed_settlement = False
             self.current_player.placed_road = False
         else:
@@ -159,6 +159,24 @@ class GameState:
                 adjacent.append(tile)
         return adjacent
 
+    def is_valid_settlement_location(self, node):
+        # Check minimum distance between settlements
+        for player in self.players:
+            for (vx, vy, _) in player.villages:
+                if math.hypot(vx - node[0], vy - node[1]) < SIZE * 1.732:
+                    return False
+        return True
+
+    def can_build_settlement(self, player):
+        return (player.resources['sheep'] >= 1 and
+                player.resources['wheat'] >= 1 and
+                player.resources['clay'] >= 1 and
+                player.resources['wood'] >= 1)
+
+    def can_build_road(self, player):
+        return (player.resources['clay'] >= 1 and
+                player.resources['wood'] >= 1)
+
 # Helper functions
 def world_to_screen(wx, wy):
     return wx * zoom + offset_x + width/2, wy * zoom + offset_y + height/2
@@ -170,18 +188,24 @@ def hexagon_vertices(x, y, size):
     return [(x + size * math.cos(math.radians(60*i - 30)),
              y + size * math.sin(math.radians(60*i - 30))) for i in range(6)]
 
-def draw_hexagon(tile_type, x, y, size, number=None):
+def draw_hexagon(tile_type, x, y, size, number=None, highlight=False):
     color = COLOR_MAP.get(tile_type, (100, 100, 100))
     pts = hexagon_vertices(x, y, size)
     spts = [world_to_screen(px, py) for px, py in pts]
     pygame.gfxdraw.filled_polygon(screen, spts, color)
     pygame.gfxdraw.aapolygon(screen, spts, (0, 0, 0))
     if number is not None:
-        label = font.render(str(number), True, (0,0,0))
+        if highlight:
+            label_font = pygame.font.SysFont("Arial", 28)
+            text_color = (255, 0, 0)
+        else:
+            label_font = font
+            text_color = (0,0,0)
+        label = label_font.render(str(number), True, text_color)
         sx, sy = world_to_screen(x, y)
-        screen.blit(label, (sx - 10, sy - 10))
+        screen.blit(label, (sx - label.get_width()/2, sy - label.get_height()/2))
 
-def draw_village(vx, vy, color, level):
+def draw_village(vx, vy, level, color):
     sx, sy = world_to_screen(vx, vy)
     size = HOUSE_SIZE * zoom
     pygame.draw.rect(screen, player_colors[color], 
@@ -215,12 +239,10 @@ def board_positions(size):
     return pos
 
 def draw_ui(game):
-    # Turn indicator
     pygame.draw.rect(screen, (100,100,100), (10, 10, 220, 30))
     text = font.render(f"Player's turn: {game.players[game.current_player_idx].color}", True, (255,255,255))
     screen.blit(text, (15, 15))
     
-    # Resource panel
     player = game.current_player
     resources = f"Sheep: {player.resources['sheep']} | Wheat: {player.resources['wheat']} | "
     resources += f"Rock: {player.resources['rock']} | Clay: {player.resources['clay']} | Wood: {player.resources['wood']}"
@@ -236,7 +258,7 @@ def handle_dice_roll(game):
     game.dice_result = dice
     
     if total == 7:
-        return  # Robber handling omitted
+        return
     
     for tile in game.tiles:
         res, num, (x,y) = tile
@@ -258,7 +280,6 @@ def main():
     game = GameState(["red", "blue", "green", "orange"])
     clock = pygame.time.Clock()
     
-    # UI elements
     roll_btn = pygame.Rect(width-140, height-50, 120, 40)
     end_turn_btn = pygame.Rect(width-140, height-100, 120, 40)
     hover_node = None
@@ -288,51 +309,75 @@ def main():
                 hover_edge = edge
                 min_edge_dist = dist
 
-        # Event handling
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 pygame.quit()
                 sys.exit()
                 
-            # Panning controls
             if event.type == pygame.MOUSEBUTTONDOWN:
                 if event.button == 1:
                     panning = True
                     pan_start_mouse = event.pos
                     pan_start_offset = (offset_x, offset_y)
                     
-                # Setup phase placements
+                elif event.button == 2:  # Middle mouse button
+                    zoom = 1.0
+                    offset_x = 0.0
+                    offset_y = 0.0
+                    
                 elif game.phase == "setup" and event.button in (1, 3):
                     current_player = game.current_player
                     
-                    # Place settlement
                     if hover_node and not current_player.placed_settlement:
-                        valid = True
-                        # Check distance from other settlements
-                        for p in game.players:
-                            for (vx, vy, _) in p.villages:
-                                if math.hypot(vx - hover_node[0], vy - hover_node[1]) < SIZE:
-                                    valid = False
-                                    break
-                        if valid:
+                        if game.is_valid_settlement_location(hover_node):
                             current_player.villages.append((hover_node[0], hover_node[1], 1))
                             current_player.placed_settlement = True
                             
-                    # Place road
                     elif hover_edge and current_player.placed_settlement and not current_player.placed_road:
-                        # Check road connects to settlement
-                        road_valid = False
                         (vx, vy) = current_player.villages[-1][:2]
                         for point in hover_edge:
                             if math.hypot(vx - point[0], vy - point[1]) < SIZE*0.1:
-                                road_valid = True
+                                current_player.roads.append(hover_edge)
+                                current_player.placed_road = True
                                 break
-                        if road_valid:
-                            current_player.roads.append(hover_edge)
-                            current_player.placed_road = True
-                            
-                    # Advance turn when both placed
+                                
                     if current_player.placed_settlement and current_player.placed_road:
+                        game.next_player()
+                        
+                # Handle regular phase building
+                elif game.phase == "regular":
+                    current_player = game.current_player
+                    if event.button == 3:  # Right click for villages
+                        if hover_node and game.is_valid_settlement_location(hover_node):
+                            required = {'sheep':1, 'wheat':1, 'clay':1, 'wood':1}
+                            if current_player.remove_resources(required):
+                                current_player.villages.append((hover_node[0], hover_node[1], 1))
+                    elif event.button == 1:  # Left click for roads
+                        if hover_edge and game.can_build_road(current_player):
+                            # Check road connection
+                            connected = False
+                            for road in current_player.roads:
+                                if hover_edge[0] in road or hover_edge[1] in road:
+                                    connected = True
+                                    break
+                            for village in current_player.villages:
+                                vx, vy, _ = village
+                                for point in hover_edge:
+                                    if math.hypot(vx - point[0], vy - point[1]) < SIZE*0.1:
+                                        connected = True
+                                        break
+                            if connected and current_player.remove_resources({'clay':1, 'wood':1}):
+                                current_player.roads.append(hover_edge)
+                                
+                # Handle dice roll click
+                if game.phase == "regular" and roll_btn.collidepoint(event.pos):
+                    if not game.dice_rolled:
+                        handle_dice_roll(game)
+                        game.dice_rolled = True
+                
+                # Handle end turn click
+                elif game.phase == "regular" and end_turn_btn.collidepoint(event.pos):
+                    if game.dice_rolled:
                         game.next_player()
                         
             elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
@@ -347,38 +392,45 @@ def main():
             elif event.type == pygame.MOUSEWHEEL:
                 zoom *= 1.1 if event.y > 0 else 0.9
                 zoom = max(0.5, min(zoom, 3.0))
-                
-            # Dice roll and end turn
-            elif event.type == pygame.MOUSEBUTTONDOWN:
-                if game.phase == "regular":
-                    if roll_btn.collidepoint(event.pos) and not game.dice_rolled:
-                        handle_dice_roll(game)
-                        game.dice_rolled = True
-                    elif end_turn_btn.collidepoint(event.pos) and game.dice_rolled:
-                        game.next_player()
 
-        # Drawing
         screen.fill((30,30,30))
         
-        # Draw tiles
+        # Draw tiles with highlight if dice matches
+        dice_total = sum(game.dice_result) if game.dice_result else None
         for res, num, pos in game.tiles:
-            draw_hexagon(res, pos[0], pos[1], SIZE*0.95, num)
+            highlight = (num == dice_total) and (res != 'desert')
+            draw_hexagon(res, pos[0], pos[1], SIZE*0.95, num, highlight)
         
-        # Highlight hover targets
-        if hover_node:
-            sx, sy = world_to_screen(*hover_node)
-            pygame.draw.circle(screen, (255,255,255,100), (int(sx), int(sy)), int(NODE_RADIUS*zoom))
-        if hover_edge:
-            draw_road(hover_edge[0], hover_edge[1], "white")
+        # Highlight buildable locations
+        current_player = game.current_player
+        if game.phase == "regular":
+            if hover_node and game.is_valid_settlement_location(hover_node) and game.can_build_settlement(current_player):
+                sx, sy = world_to_screen(*hover_node)
+                pygame.draw.circle(screen, (255,255,255,100), (int(sx), int(sy)), int(NODE_RADIUS*zoom))
+            
+            if hover_edge and game.can_build_road(current_player):
+                # Check road connection
+                connected = False
+                for road in current_player.roads:
+                    if hover_edge[0] in road or hover_edge[1] in road:
+                        connected = True
+                        break
+                for village in current_player.villages:
+                    vx, vy, _ = village
+                    for point in hover_edge:
+                        if math.hypot(vx - point[0], vy - point[1]) < SIZE*0.1:
+                            connected = True
+                            break
+                if connected:
+                    draw_road(hover_edge[0], hover_edge[1], "white")
         
         # Draw villages and roads
         for player in game.players:
             for village in player.villages:
-                draw_village(*village)
+                draw_village(*village, player.color)
             for road in player.roads:
                 draw_road(*road, player.color)
         
-        # Draw UI
         draw_ui(game)
         
         # Draw buttons
@@ -394,7 +446,6 @@ def main():
                 text = font.render("End Turn", True, (255,255,255))
                 screen.blit(text, (end_turn_btn.x+10, end_turn_btn.y+10))
                 
-                # Dice result
                 if game.dice_result:
                     dice_text = font.render(f"{game.dice_result[0]} + {game.dice_result[1]} = {sum(game.dice_result)}", True, (255,255,255))
                     screen.blit(dice_text, (width-140, height-150))
