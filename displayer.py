@@ -1,456 +1,624 @@
-# Catan Board Game Simulator
-import sys
-import os
-os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "1"
-import pygame
-import pygame.gfxdraw
-import math
-import warnings
-import random as rd
-from collections import defaultdict
+# catan.py — Fully Functional Catan Simulator
+import sys, os, math, random
+from collections import Counter
+import pygame, pygame.gfxdraw
 
+# ─────────────────────────────────────────────────────────────────────────────
 # Constants
-SIZE = 70
-HOUSE_SIZE = SIZE // 8
-ROAD_LENGTH = SIZE * 0.55
-ROAD_WIDTH = SIZE * 0.15
-NODE_RADIUS = SIZE * 0.10
-NODE_DETECTION_RADIUS = NODE_RADIUS * 1.1
-BUTTON_WIDTH, BUTTON_HEIGHT = 120, 40
+SIZE         = 70
+HOUSE_SIZE   = SIZE // 8
+ROAD_WIDTH   = int(SIZE * 0.15)
+NODE_RADIUS  = SIZE * 0.10
+NODE_DETECT  = NODE_RADIUS * 1.2
 RESOURCE_TYPES = ["sheep", "wheat", "rock", "clay", "wood"]
 COLOR_MAP = {
-    "sheep": (200, 255, 200),
-    "wheat": (255, 240, 150),
-    "clay": (205, 92, 92),
-    "wood": (139, 69, 19),
-    "rock": (160, 160, 160),
-    "desert": (238, 214, 175),
+    "sheep":  (200,255,200),
+    "wheat":  (255,240,150),
+    "clay":   (205, 92, 92),
+    "wood":   (139, 69, 19),
+    "rock":   (160,160,160),
+    "desert": (238,214,175),
 }
+PORT_TYPES   = RESOURCE_TYPES + ["generic"]*4
+PLAYER_COLORS= ["red","blue","green","orange"]
 
-# Environment setup
+# Pygame init
 os.environ['SDL_VIDEO_WINDOW_POS'] = '0,0'
-os.environ["PYTHONWARNINGS"] = "ignore"
-warnings.filterwarnings("ignore")
 pygame.init()
-width, height = 800, 600
-screen = pygame.display.set_mode((width, height))
-pygame.display.set_caption("Catan Board")
-font = pygame.font.SysFont("Arial", 24)
-player_colors = {
-    "white": (255, 255, 255),
-    "red": (255, 0, 0),
-    "blue": (0, 0, 255),
-    "green": (0, 255, 0),
-    "orange": (255, 165, 0),
-}
+WIDTH, HEIGHT = 900, 650
+screen = pygame.display.set_mode((WIDTH, HEIGHT))
+pygame.display.set_caption("Catan")
+font = pygame.font.SysFont("Arial", 20)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Utility transforms
+def world_to_screen(x,y):
+    return int(WIDTH/2 + x), int(HEIGHT/2 + y)
+def screen_to_world(sx,sy):
+    return sx - WIDTH/2, sy - HEIGHT/2
+
+# Board layout (3-4-5-4-3)
+def board_positions(size):
+    rows = [3,4,5,4,3]
+    v = size * 1.5
+    h = size * math.sqrt(3)
+    y0= -2*v
+    pts=[]
+    for r,cnt in enumerate(rows):
+        y=y0 + r*v
+        x0=-h*(cnt-1)/2
+        for i in range(cnt):
+            pts.append((x0 + i*h, y))
+    return pts, rows
+
+def hexagon_vertices(cx,cy,size):
+    return [
+        (cx + size*math.cos(math.radians(60*i - 30)),
+         cy + size*math.sin(math.radians(60*i - 30)))
+        for i in range(6)
+    ]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Player state
 class Player:
     def __init__(self, color):
-        self.color = color
-        self.resources = defaultdict(int)
-        self.villages = []  # (x, y, level)
-        self.roads = []
-        self.placed_settlement = False
-        self.placed_road = False
+        self.color     = color
+        self.resources = Counter()
+        self.houses    = []   # global house IDs
+        self.roads     = []   # global road IDs
 
-    def add_resources(self, resources):
-        for res, count in resources.items():
-            self.resources[res] += count
-            
-    def remove_resources(self, resources):
-        for res, count in resources.items():
-            if self.resources[res] < count:
-                return False
-        for res, count in resources.items():
-            self.resources[res] -= count
-        return True
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Main Game State
 class GameState:
-    def __init__(self, players):
-        self.players = [Player(color) for color in players]
-        self.current_player_idx = 0
-        self.phase = "setup"
-        self.setup_phase = "forward"
+    def __init__(self, n=4):
+        self.n   = n
+        # players in fixed colors
+        self.players = [Player(PLAYER_COLORS[i]) for i in range(n)]
+
+        # setup turn order: forward settlements & roads, then reverse
+        seq = []
+        for i in range(n):
+            seq.append((i,'settlement'))
+            seq.append((i,'road'))
+        for i in reversed(range(n)):
+            seq.append((i,'settlement'))
+            seq.append((i,'road'))
+        self.setup_seq = seq
+        self.seq_i     = 0
+        self.phase     = 'setup'   # or 'regular','discard','robber','rob_choose'
         self.dice_rolled = False
-        self.tiles = []
-        self.valid_nodes = []
-        self.valid_edges = []
-        self.initialize_board()
         self.dice_result = None
+
+        # Build hex grid
+        pts, self.rows = board_positions(SIZE)
+        self.flat_to_rc     = {}
+        self.centers   = []
+        idx=0
+        for r,cnt in enumerate(self.rows):
+            row=[]
+            for _ in range(cnt):
+                row.append(pts[idx])
+                self.flat_to_rc[idx] = (r,len(row)-1)
+                idx+=1
+            self.centers.append(row)
+
+        # Spiral ordering for numbers
+        spiral = [0,1,2,7,12,17,18,13,8,3,4,9,14,16,15,10,5,6,11]
+        # Resources & token numbers
+        pool = ["wood"]*4 + ["sheep"]*4 + ["wheat"]*4 + ["clay"]*3 + ["rock"]*3 + ["desert"]
+        random.shuffle(pool)
+        nums = [2,3,3,4,4,5,5,6,6,8,8,9,9,10,10,11,11,12]
+        random.shuffle(nums); ni=0; desert_placed=False
+
+        # board[r][c] = [res,num]
+        self.board = [[None]*cnt for cnt in self.rows]
+        for flat in spiral:
+            r,c = self.flat_to_rc[flat]
+            res = pool.pop()
+            if res=='desert' and not desert_placed:
+                num=None
+                desert_placed=True
+                self.robber = flat
+            else:
+                num = nums[ni]; ni+=1
+            self.board[r][c] = [res,num]
+
+        # Compute nodes & edges per tile
+        self.tile_nodes=[]
+        self.tile_edges=[]
+        edge_count={}
+        for flat in range(idx):
+            r,c = self.flat_to_rc[flat]
+            cx,cy = self.centers[r][c]
+            verts = hexagon_vertices(cx,cy,SIZE)
+            self.tile_nodes.append(verts)
+            es=[]
+            for i in range(6):
+                e = tuple(sorted([verts[i], verts[(i+1)%6]]))
+                es.append(e)
+                edge_count[e] = edge_count.get(e,0) + 1
+            self.tile_edges.append(es)
+
+        # All valid nodes & edges
+        self.valid_nodes = list({v for verts in self.tile_nodes for v in verts})
+        self.valid_edges = list(edge_count.keys())
+
+        # Ports: pick coastal edges (count==1), place marker at outer vertex
+        coastal = [e for e,cnt in edge_count.items() if cnt==1]
+        chosen = random.sample(coastal, min(len(coastal),9))
+        random.shuffle(PORT_TYPES)
+        self.ports=[]
+        for e,ptype in zip(chosen, PORT_TYPES):
+            # place at node farther from board center
+            v_out = max(e, key=lambda v: math.hypot(v[0],v[1]))
+            self.ports.append((v_out,ptype))
+
+        # initialize first turn
+        self.current_idx, self.current_act = self.setup_seq[0]
 
     @property
     def current_player(self):
-        return self.players[self.current_player_idx]
-    
-    def initialize_board(self):
-        resources = ["wood"]*4 + ["sheep"]*4 + ["wheat"]*4 + ["clay"]*3 + ["rock"]*3 + ["desert"]
-        rd.shuffle(resources)
-        
-        numbers = [2,3,3,4,4,5,5,6,6,8,8,9,9,10,10,11,11,12]
-        rd.shuffle(numbers)
-        
-        spiral_order = [0,1,2,7,12,17,18,13,8,3,4,9,14,16,15,10,5,6,11]
-        centers = board_positions(SIZE)
-        
-        self.tiles = []
-        number_idx = 0
-        desert_placed = False
-        
-        for idx in spiral_order:
-            res = resources.pop()
-            pos = centers[idx]
-            if res == "desert" and not desert_placed:
-                self.tiles.append((res, None, pos))
-                desert_placed = True
-            else:
-                self.tiles.append((res, numbers[number_idx], pos))
-                number_idx += 1
-        
-        # Generate valid nodes and edges
-        self.valid_nodes = []
-        self.valid_edges = []
-        for tile in self.tiles:
-            x, y = tile[2]
-            vertices = hexagon_vertices(x, y, SIZE)
-            for vx, vy in vertices:
-                if (vx, vy) not in self.valid_nodes:
-                    self.valid_nodes.append((vx, vy))
-            for i in range(6):
-                v1 = vertices[i]
-                v2 = vertices[(i+1)%6]
-                edge = tuple(sorted([v1, v2]))
-                if edge not in self.valid_edges:
-                    self.valid_edges.append(edge)
+        return self.players[self.current_idx]
 
-    def next_player(self):
-        if self.phase == "setup":
-            if self.setup_phase == "forward":
-                self.current_player_idx = (self.current_player_idx + 1) % len(self.players)
-                if self.current_player_idx == 0:
-                    self.setup_phase = "reverse"
-                    self.current_player_idx = len(self.players) - 1
-            else:
-                self.current_player_idx -= 1
-                if self.current_player_idx < 0:
-                    self.phase = "regular"
-                    self.current_player_idx = 0
-                    self.distribute_initial_resources()
-            self.current_player.placed_settlement = False
-            self.current_player.placed_road = False
+    # Advance through setup
+    def next_setup(self):
+        self.seq_i+=1
+        if self.seq_i < len(self.setup_seq):
+            self.current_idx, self.current_act = self.setup_seq[self.seq_i]
         else:
-            self.current_player_idx = (self.current_player_idx + 1) % len(self.players)
-        self.dice_rolled = False
+            self.phase = 'regular'
+            self.current_idx = 0
 
-    def distribute_initial_resources(self):
-        for player in self.players:
-            for (x, y, _) in player.villages:
-                adjacent_tiles = self.get_adjacent_tiles(x, y)
-                for tile in adjacent_tiles:
-                    res, num, _ = tile
-                    if res != "desert":
-                        player.add_resources({res: 1})
+    # Build cost checks
+    def can_build_settlement(self):
+        p=self.current_player
+        return all(p.resources[r]>=1 for r in ["sheep","wheat","clay","wood"])
+    def can_build_road(self):
+        p=self.current_player
+        return p.resources["clay"]>=1 and p.resources["wood"]>=1
 
-    def get_adjacent_tiles(self, x, y):
-        adjacent = []
-        for tile in self.tiles:
-            tx, ty = tile[2]
-            distance = math.hypot(tx - x, ty - y)
-            if distance < SIZE * 1.1:
-                adjacent.append(tile)
-        return adjacent
-
-    def is_valid_settlement_location(self, node):
-        # Check minimum distance between settlements
-        for player in self.players:
-            for (vx, vy, _) in player.villages:
-                if math.hypot(vx - node[0], vy - node[1]) < SIZE * 1.732:
+    # Settlement validity: empty + no adjacent
+    def is_valid_settlement(self, node):
+        # not occupied
+        for p in self.players:
+            for hid in p.houses:
+                tid,loc = divmod(hid-1,12)
+                corner = loc if loc<6 else loc-6
+                if self.tile_nodes[tid][corner]==node:
                     return False
+        # no adjacent
+        for e in self.valid_edges:
+            if node in e:
+                other = e[1] if e[0]==node else e[0]
+                for p in self.players:
+                    for hid in p.houses:
+                        tid,loc=divmod(hid-1,12)
+                        cor = loc if loc<6 else loc-6
+                        if self.tile_nodes[tid][cor]==other:
+                            return False
         return True
 
-    def can_build_settlement(self, player):
-        return (player.resources['sheep'] >= 1 and
-                player.resources['wheat'] >= 1 and
-                player.resources['clay'] >= 1 and
-                player.resources['wood'] >= 1)
+    # Map node→global house ID
+    def house_id(self, node):
+        for tid,verts in enumerate(self.tile_nodes):
+            if node in verts:
+                local = verts.index(node)+1
+                return tid*12 + local
+        return None
 
-    def can_build_road(self, player):
-        return (player.resources['clay'] >= 1 and
-                player.resources['wood'] >= 1)
+    # Map edge→global road ID
+    def edge_id(self, edge):
+        for tid,edges in enumerate(self.tile_edges):
+            for i,e in enumerate(edges):
+                if e==edge:
+                    return tid*6 + (i+1)
+        return None
 
-# Helper functions
-def world_to_screen(wx, wy):
-    return wx * zoom + offset_x + width/2, wy * zoom + offset_y + height/2
-
-def screen_to_world(sx, sy):
-    return (sx - width/2 - offset_x)/zoom, (sy - height/2 - offset_y)/zoom
-
-def hexagon_vertices(x, y, size):
-    return [(x + size * math.cos(math.radians(60*i - 30)),
-             y + size * math.sin(math.radians(60*i - 30))) for i in range(6)]
-
-def draw_hexagon(tile_type, x, y, size, number=None, highlight=False):
-    color = COLOR_MAP.get(tile_type, (100, 100, 100))
-    pts = hexagon_vertices(x, y, size)
-    spts = [world_to_screen(px, py) for px, py in pts]
-    pygame.gfxdraw.filled_polygon(screen, spts, color)
-    pygame.gfxdraw.aapolygon(screen, spts, (0, 0, 0))
-    if number is not None:
-        if highlight:
-            label_font = pygame.font.SysFont("Arial", 28)
-            text_color = (255, 0, 0)
-        else:
-            label_font = font
-            text_color = (0,0,0)
-        label = label_font.render(str(number), True, text_color)
-        sx, sy = world_to_screen(x, y)
-        screen.blit(label, (sx - label.get_width()/2, sy - label.get_height()/2))
-
-def draw_village(vx, vy, level, color):
-    sx, sy = world_to_screen(vx, vy)
-    size = HOUSE_SIZE * zoom
-    pygame.draw.rect(screen, player_colors[color], 
-                    (sx - size, sy - size, 2*size, 2*size))
-    if level == 2:
-        pygame.draw.circle(screen, (255,255,0), (int(sx), int(sy)), int(size/2))
-
-def draw_road(p1, p2, color):
-    x1, y1 = world_to_screen(*p1)
-    x2, y2 = world_to_screen(*p2)
-    mx, my = (x1 + x2)/2, (y1 + y2)/2
-    angle = math.atan2(y2 - y1, x2 - x1)
-    length = math.hypot(x2 - x1, y2 - y1) * 0.65
-    road_surf = pygame.Surface((length, ROAD_WIDTH * zoom), pygame.SRCALPHA)
-    road_surf.fill(player_colors[color])
-    rotated = pygame.transform.rotate(road_surf, -math.degrees(angle))
-    screen.blit(rotated, rotated.get_rect(center=(mx, my)))
-
-def board_positions(size):
-    pos = []
-    v_dist = size * 1.5
-    h_dist = size * math.sqrt(3)
-    row_counts = [3,4,5,4,3]
-    y_start = -v_dist * 2
-    for row_idx, count in enumerate(row_counts):
-        wy = y_start + row_idx * v_dist
-        x_start = -((count-1)*h_dist)/2
-        for i in range(count):
-            wx = x_start + i * h_dist
-            pos.append((wx, wy))
-    return pos
-
-def draw_ui(game):
-    pygame.draw.rect(screen, (100,100,100), (10, 10, 220, 30))
-    text = font.render(f"Player's turn: {game.players[game.current_player_idx].color}", True, (255,255,255))
-    screen.blit(text, (15, 15))
-    
-    player = game.current_player
-    resources = f"Sheep: {player.resources['sheep']} | Wheat: {player.resources['wheat']} | "
-    resources += f"Rock: {player.resources['rock']} | Clay: {player.resources['clay']} | Wood: {player.resources['wood']}"
-    pygame.draw.rect(screen, (200,200,200), (10, height-60, width-20, 50))
-    text = font.render(resources, True, (0,0,0))
-    screen.blit(text, (20, height-50))
-
-def handle_dice_roll(game):
-    if game.phase != "regular":
-        return
-    dice = (rd.randint(1,6), rd.randint(1,6))
-    total = sum(dice)
-    game.dice_result = dice
-    
-    if total == 7:
-        return
-    
-    for tile in game.tiles:
-        res, num, (x,y) = tile
-        if num == total and res != "desert":
-            for player in game.players:
-                for (vx, vy, level) in player.villages:
-                    distance = math.hypot(vx - x, vy - y)
-                    if distance < SIZE * 1.1:
-                        player.add_resources({res: 2 if level == 2 else 1})
-
-def main():
-    global zoom, offset_x, offset_y
-    zoom = 1.0
-    offset_x, offset_y = 0.0, 0.0
-    panning = False
-    pan_start_mouse = (0, 0)
-    pan_start_offset = (0, 0)
-    
-    game = GameState(["red", "blue", "green", "orange"])
-    clock = pygame.time.Clock()
-    
-    roll_btn = pygame.Rect(width-140, height-50, 120, 40)
-    end_turn_btn = pygame.Rect(width-140, height-100, 120, 40)
-    hover_node = None
-    hover_edge = None
-    
-    while True:
-        mx, my = pygame.mouse.get_pos()
-        wx, wy = screen_to_world(mx, my)
-        
-        # Find hover targets
-        hover_node = None
-        min_dist = NODE_DETECTION_RADIUS
-        for node in game.valid_nodes:
-            dist = math.hypot(node[0]-wx, node[1]-wy)
-            if dist < min_dist:
-                hover_node = node
-                min_dist = dist
-                
-        hover_edge = None
-        min_edge_dist = ROAD_LENGTH*0.6
-        for edge in game.valid_edges:
-            p1, p2 = edge
-            mx_edge = (p1[0]+p2[0])/2
-            my_edge = (p1[1]+p2[1])/2
-            dist = math.hypot(mx_edge-wx, my_edge-wy)
-            if dist < min_edge_dist:
-                hover_edge = edge
-                min_edge_dist = dist
-
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                pygame.quit()
-                sys.exit()
-                
-            if event.type == pygame.MOUSEBUTTONDOWN:
-                if event.button == 1:
-                    panning = True
-                    pan_start_mouse = event.pos
-                    pan_start_offset = (offset_x, offset_y)
-                    
-                elif event.button == 2:  # Middle mouse button
-                    zoom = 1.0
-                    offset_x = 0.0
-                    offset_y = 0.0
-                    
-                elif game.phase == "setup" and event.button in (1, 3):
-                    current_player = game.current_player
-                    
-                    if hover_node and not current_player.placed_settlement:
-                        if game.is_valid_settlement_location(hover_node):
-                            current_player.villages.append((hover_node[0], hover_node[1], 1))
-                            current_player.placed_settlement = True
-                            
-                    elif hover_edge and current_player.placed_settlement and not current_player.placed_road:
-                        (vx, vy) = current_player.villages[-1][:2]
-                        for point in hover_edge:
-                            if math.hypot(vx - point[0], vy - point[1]) < SIZE*0.1:
-                                current_player.roads.append(hover_edge)
-                                current_player.placed_road = True
-                                break
-                                
-                    if current_player.placed_settlement and current_player.placed_road:
-                        game.next_player()
-                        
-                # Handle regular phase building
-                elif game.phase == "regular":
-                    current_player = game.current_player
-                    if event.button == 3:  # Right click for villages
-                        if hover_node and game.is_valid_settlement_location(hover_node):
-                            required = {'sheep':1, 'wheat':1, 'clay':1, 'wood':1}
-                            if current_player.remove_resources(required):
-                                current_player.villages.append((hover_node[0], hover_node[1], 1))
-                    elif event.button == 1:  # Left click for roads
-                        if hover_edge and game.can_build_road(current_player):
-                            # Check road connection
-                            connected = False
-                            for road in current_player.roads:
-                                if hover_edge[0] in road or hover_edge[1] in road:
-                                    connected = True
-                                    break
-                            for village in current_player.villages:
-                                vx, vy, _ = village
-                                for point in hover_edge:
-                                    if math.hypot(vx - point[0], vy - point[1]) < SIZE*0.1:
-                                        connected = True
-                                        break
-                            if connected and current_player.remove_resources({'clay':1, 'wood':1}):
-                                current_player.roads.append(hover_edge)
-                                
-                # Handle dice roll click
-                if game.phase == "regular" and roll_btn.collidepoint(event.pos):
-                    if not game.dice_rolled:
-                        handle_dice_roll(game)
-                        game.dice_rolled = True
-                
-                # Handle end turn click
-                elif game.phase == "regular" and end_turn_btn.collidepoint(event.pos):
-                    if game.dice_rolled:
-                        game.next_player()
-                        
-            elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
-                panning = False
-                
-            elif event.type == pygame.MOUSEMOTION and panning:
-                dx = event.pos[0] - pan_start_mouse[0]
-                dy = event.pos[1] - pan_start_mouse[1]
-                offset_x = pan_start_offset[0] + dx
-                offset_y = pan_start_offset[1] + dy
-                
-            elif event.type == pygame.MOUSEWHEEL:
-                zoom *= 1.1 if event.y > 0 else 0.9
-                zoom = max(0.5, min(zoom, 3.0))
-
-        screen.fill((30,30,30))
-        
-        # Draw tiles with highlight if dice matches
-        dice_total = sum(game.dice_result) if game.dice_result else None
-        for res, num, pos in game.tiles:
-            highlight = (num == dice_total) and (res != 'desert')
-            draw_hexagon(res, pos[0], pos[1], SIZE*0.95, num, highlight)
-        
-        # Highlight buildable locations
-        current_player = game.current_player
-        if game.phase == "regular":
-            if hover_node and game.is_valid_settlement_location(hover_node) and game.can_build_settlement(current_player):
-                sx, sy = world_to_screen(*hover_node)
-                pygame.draw.circle(screen, (255,255,255,100), (int(sx), int(sy)), int(NODE_RADIUS*zoom))
-            
-            if hover_edge and game.can_build_road(current_player):
-                # Check road connection
-                connected = False
-                for road in current_player.roads:
-                    if hover_edge[0] in road or hover_edge[1] in road:
-                        connected = True
-                        break
-                for village in current_player.villages:
-                    vx, vy, _ = village
-                    for point in hover_edge:
-                        if math.hypot(vx - point[0], vy - point[1]) < SIZE*0.1:
-                            connected = True
-                            break
-                if connected:
-                    draw_road(hover_edge[0], hover_edge[1], "white")
-        
-        # Draw villages and roads
-        for player in game.players:
-            for village in player.villages:
-                draw_village(*village, player.color)
-            for road in player.roads:
-                draw_road(*road, player.color)
-        
-        draw_ui(game)
-        
-        # Draw buttons
-        if game.phase == "regular":
-            if not game.dice_rolled:
-                # Roll dice button
-                pygame.draw.rect(screen, (0,150,0) if roll_btn.collidepoint(mx,my) else (0,100,0), roll_btn)
-                text = font.render("Roll Dice", True, (255,255,255))
-                screen.blit(text, (roll_btn.x+10, roll_btn.y+10))
+    # Distribute resources on dice (excluding robber logic here)
+    def handle_dice(self):
+        d1,d2 = random.randint(1,6),random.randint(1,6)
+        self.dice_result=(d1,d2)
+        self.dice_rolled=True
+        tot = d1+d2
+        if tot==7:
+            # DISCARD phase
+            self.discard_list = [i for i,p in enumerate(self.players)
+                                 if sum(p.resources.values())>7]
+            self.discard_ptr = 0
+            if self.discard_list:
+                self.phase="discard"
+                self.current_idx=self.discard_list[0]
+                self.to_discard = sum(self.current_player.resources.values())//2
+                self.discarded=0
             else:
-                # End turn button
-                pygame.draw.rect(screen, (150,0,0) if end_turn_btn.collidepoint(mx,my) else (100,0,0), end_turn_btn)
-                text = font.render("End Turn", True, (255,255,255))
-                screen.blit(text, (end_turn_btn.x+10, end_turn_btn.y+10))
-                
-                if game.dice_result:
-                    dice_text = font.render(f"{game.dice_result[0]} + {game.dice_result[1]} = {sum(game.dice_result)}", True, (255,255,255))
-                    screen.blit(dice_text, (width-140, height-150))
+                self.phase="robber"
+            return
+        # normal resource distribution
+        for flat, verts in enumerate(self.tile_nodes):
+            r,c = flat//len(self.rows[0]), flat%len(self.rows[0])  # adjust mapping
+            res,num = self.board[r][c]
+            if num==tot and res!="desert":
+                cx,cy = self.centers[r][c]
+                for p in self.players:
+                    for hid in p.houses:
+                        tid,loc=divmod(hid-1,12)
+                        lvl = 1 if loc<6 else 2
+                        cor = loc if loc<6 else loc-6
+                        x,y = self.tile_nodes[tid][cor]
+                        if math.hypot(x-cx,y-cy) < SIZE*1.1:
+                            p.resources[res] += (2 if lvl==2 else 1)
+
+    # Move robber to a new tile by clicking a node inside it
+    def move_robber(self, node):
+        for flat, verts in enumerate(self.tile_nodes):
+            # find tile center
+            r,c = flat//len(self.rows[0]), flat%len(self.rows[0])
+            cx,cy = self.centers[r][c]
+            if math.hypot(cx-node[0], cy-node[1])<SIZE*0.6 and flat!=self.robber:
+                self.robber=flat
+                # determine victims
+                victims=[]
+                for i,p in enumerate(self.players):
+                    if i==self.current_idx: continue
+                    for hid in p.houses:
+                        tid,loc=divmod(hid-1,12)
+                        cor = loc if loc<6 else loc-6
+                        x,y = self.tile_nodes[tid][cor]
+                        if math.hypot(x-cx,y-cy)<SIZE*1.1:
+                            victims.append(i); break
+                if victims:
+                    self.phase="rob_choose"
+                    self.rob_victims=victims
+                else:
+                    self.phase="regular"
+                return
+
+    # Transfer one random resource from victim to current player
+    def rob_transfer(self, victim_idx):
+        victim = self.players[victim_idx]
+        pool = []
+        for r,cnt in victim.resources.items():
+            pool += [r]*cnt
+        if pool:
+            res = random.choice(pool)
+            victim.resources[res]-=1
+            self.current_player.resources[res]+=1
+        self.phase="regular"
+
+    # Advance to next player (regular turn)
+    def next_player(self):
+        self.current_idx = (self.current_idx+1)%self.n
+        self.dice_rolled=False
+        self.dice_result=None
+        if self.phase=="regular":
+            pass
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Drawing helpers
+def draw_hex(res_num, center, highlight=False):
+    res,num = res_num
+    col = COLOR_MAP[res]
+    pts = hexagon_vertices(center[0], center[1], SIZE*0.95)
+    spts= [world_to_screen(x,y) for x,y in pts]
+    pygame.gfxdraw.filled_polygon(screen, spts, col)
+    pygame.gfxdraw.aapolygon(screen, spts, (0,0,0))
+    if num:
+        txt = font.render(str(num), True, (255,0,0) if highlight else (0,0,0))
+        sx,sy = world_to_screen(*center)
+        screen.blit(txt, (sx-txt.get_width()/2, sy-txt.get_height()/2))
+
+def draw_settlement(node, level, color):
+    sx,sy=world_to_screen(*node)
+    sz = HOUSE_SIZE
+    pygame.draw.rect(screen, pygame.Color(color), (sx-sz, sy-sz, 2*sz, 2*sz))
+    if level==2:
+        pygame.draw.circle(screen,(255,255,0),(sx,sy),sz//2)
+
+def draw_road(edge, color):
+    (x1,y1),(x2,y2)=edge
+    sx1,sy1=world_to_screen(x1,y1)
+    sx2,sy2=world_to_screen(x2,y2)
+    pygame.draw.line(screen, pygame.Color(color), (sx1,sy1),(sx2,sy2), ROAD_WIDTH)
+
+def draw_robber(center):
+    sx,sy=world_to_screen(*center)
+    surf=pygame.Surface((SIZE,SIZE),pygame.SRCALPHA)
+    pygame.draw.circle(surf, (0,0,0,100), (SIZE//2,SIZE//2), SIZE//2)
+    screen.blit(surf,(sx-SIZE//2, sy-SIZE//2))
+
+def draw_ports(ports):
+    for node,ptype in ports:
+        sx,sy=world_to_screen(*node)
+        pygame.gfxdraw.filled_circle(screen, sx,sy, int(SIZE*0.2), (255,255,255,200))
+        lbl=font.render(ptype[0].upper(), True, (0,0,0))
+        screen.blit(lbl,(sx-lbl.get_width()/2, sy-lbl.get_height()/2))
+
+# Hit-box overlays
+def draw_hitbox_node(node):
+    sx,sy=world_to_screen(*node)
+    pygame.gfxdraw.filled_circle(screen, sx,sy, int(NODE_RADIUS*1.5), (255,255,255,80))
+
+def draw_hitbox_edge(edge):
+    mx = (edge[0][0]+edge[1][0])/2
+    my = (edge[0][1]+edge[1][1])/2
+    sx,sy=world_to_screen(mx,my)
+    pygame.gfxdraw.filled_circle(screen, sx,sy, int(NODE_RADIUS*1.2), (255,255,255,80))
+
+# UI bar
+def draw_ui(game):
+    # turn display
+    txt=font.render(f"Turn: {game.current_player.color}", True, (255,255,255))
+    screen.blit(txt, (10,10))
+    # resources with colored background
+    x,y = 10, HEIGHT-40
+    for res in RESOURCE_TYPES:
+        cnt = game.current_player.resources[res]
+        lbl = font.render(f"{res}: {cnt}", True, (0,0,0))
+        w,h = lbl.get_width()+6, lbl.get_height()+4
+        bg = pygame.Surface((w,h))
+        bg.fill(COLOR_MAP[res])
+        screen.blit(bg,(x,y))
+        screen.blit(lbl,(x+3,y+2))
+        x += w+6
+    # Roll / End buttons
+    if game.phase=="regular":
+        if not game.dice_rolled:
+            br = pygame.Rect(WIDTH-150, HEIGHT-70, 140,50)
+            pygame.draw.rect(screen,(0,120,0),br)
+            screen.blit(font.render("Roll Dice", True, (255,255,255)), (WIDTH-140, HEIGHT-60))
+            game.btn_roll = br
+        else:
+            be = pygame.Rect(WIDTH-150, HEIGHT-70, 140,50)
+            pygame.draw.rect(screen,(120,0,0),be)
+            screen.blit(font.render("End Turn", True, (255,255,255)), (WIDTH-140, HEIGHT-60))
+            game.btn_end = be
+            d=game.dice_result
+            screen.blit(font.render(f"{d[0]} + {d[1]} = {sum(d)}", True, (255,255,255)),
+                        (WIDTH-150, HEIGHT-140))
+    # Discard menu
+    if game.phase=="discard":
+        overlay=pygame.Surface((WIDTH,HEIGHT),pygame.SRCALPHA)
+        overlay.fill((0,0,0,150)); screen.blit(overlay,(0,0))
+        req = game.to_discard - game.discarded
+        txt=font.render(f"Discard {req} cards", True, (255,255,255))
+        screen.blit(txt,(WIDTH//2-txt.get_width()//2,50))
+        game.disc_buttons=[]
+        y0=120
+        for res,cnt in game.current_player.resources.items():
+            if cnt>0:
+                lbl=font.render(f"{res}: {cnt}",True,(0,0,0))
+                w,h=lbl.get_width()+10, lbl.get_height()+6
+                rct=pygame.Rect(WIDTH//2-w//2, y0, w,h)
+                pygame.draw.rect(screen,(200,200,200),rct)
+                screen.blit(lbl,(rct.x+5, rct.y+3))
+                game.disc_buttons.append((res,rct))
+                y0 += h+10
+    # Place robber prompt
+    if game.phase=="robber":
+        overlay=pygame.Surface((WIDTH,HEIGHT),pygame.SRCALPHA)
+        overlay.fill((0,0,0,100)); screen.blit(overlay,(0,0))
+        txt=font.render("Place Robber",True,(255,255,255))
+        screen.blit(txt,(WIDTH//2-txt.get_width()//2,20))
+    # Rob victim choice
+    if game.phase=="rob_choose":
+        overlay=pygame.Surface((WIDTH,HEIGHT),pygame.SRCALPHA)
+        overlay.fill((0,0,0,150)); screen.blit(overlay,(0,0))
+        txt=font.render("Choose victim",True,(255,255,255))
+        screen.blit(txt,(WIDTH//2-txt.get_width()//2,20))
+        game.rob_buttons=[]
+        y0=80
+        for vid in game.rob_victims:
+            col = game.players[vid].color
+            lbl=font.render(col,True,(0,0,0))
+            w,h=lbl.get_width()+10, lbl.get_height()+6
+            rct=pygame.Rect(WIDTH//2-w//2, y0, w,h)
+            pygame.draw.rect(screen,pygame.Color(col),rct)
+            screen.blit(lbl,(rct.x+5,rct.y+3))
+            game.rob_buttons.append((vid,rct))
+            y0+=h+10
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main loop
+def main():
+    clock=pygame.time.Clock()
+    game = GameState(4)
+
+    while True:
+        mx,my = pygame.mouse.get_pos()
+        wx,wy = screen_to_world(mx,my)
+
+        # hover detection
+        hover_node=None
+        for v in game.valid_nodes:
+            if math.hypot(v[0]-wx, v[1]-wy) < NODE_DETECT:
+                hover_node=v; break
+        hover_edge=None
+        for e in game.valid_edges:
+            midx = (e[0][0]+e[1][0])/2
+            midy = (e[0][1]+e[1][1])/2
+            if math.hypot(midx-wx, midy-wy) < SIZE*0.6:
+                hover_edge=e; break
+
+        for ev in pygame.event.get():
+            if ev.type==pygame.QUIT:
+                pygame.quit(); sys.exit()
+
+            if ev.type==pygame.MOUSEBUTTONDOWN and ev.button==1:
+                # SETUP PHASE
+                if game.phase=="setup":
+                    if game.current_act=="settlement" and hover_node and game.is_valid_settlement(hover_node):
+                        hid = game.house_id(hover_node)
+                        game.current_player.houses.append(hid)
+                        # second placement grants resource
+                        if game.seq_i >= game.n:
+                            # distribute 1 from each adjacent tile
+                            for flat,verts in enumerate(game.tile_nodes):
+                                r,c = divmod(flat, len(game.rows))
+                                cx,cy = game.centers[r][c]
+                                if math.hypot(game.centers[r][c][0]-hover_node[0],
+                                              game.centers[r][c][1]-hover_node[1])<SIZE*1.1:
+                                    res,_ = game.board[r][c]
+                                    if res!="desert":
+                                        game.current_player.resources[res]+=1
+                        game.next_setup()
+
+                    elif game.current_act=="road" and hover_edge:
+                        rid = game.edge_id(hover_edge)
+                        game.current_player.roads.append(rid)
+                        game.next_setup()
+
+                # REGULAR PHASE
+                elif game.phase=="regular":
+                    # Roll
+                    if hasattr(game,"btn_roll") and game.btn_roll.collidepoint(mx,my) \
+                       and not game.dice_rolled:
+                        game.handle_dice()
+
+                    # End turn
+                    elif hasattr(game,"btn_end") and game.btn_end.collidepoint(mx,my) \
+                         and game.dice_rolled:
+                        game.next_player()
+
+                    # Build settlement
+                    elif hover_node and game.can_build_settlement() and game.is_valid_settlement(hover_node):
+                        # pay
+                        for r in ["sheep","wheat","clay","wood"]:
+                            game.current_player.resources[r]-=1
+                        hid=game.house_id(hover_node)
+                        game.current_player.houses.append(hid)
+
+                    # Build road (right-click)
+                    # handled in BUTTONDOWN 3 below
+
+                # DISCARD PHASE
+                elif game.phase=="discard":
+                    for res,rct in game.disc_buttons:
+                        if rct.collidepoint(mx,my):
+                            game.current_player.resources[res]-=1
+                            game.discarded+=1
+                            if game.discarded>=game.to_discard:
+                                game.discard_ptr+=1
+                                if game.discard_ptr<len(game.discard_list):
+                                    next_idx = game.discard_list[game.discard_ptr]
+                                    game.current_idx = next_idx
+                                    game.to_discard = sum(game.current_player.resources.values())//2
+                                    game.discarded=0
+                                else:
+                                    game.phase="robber"
+                            break
+
+                # ROBBER PLACEMENT
+                elif game.phase=="robber":
+                    if hover_node:
+                        game.move_robber(hover_node)
+
+                # ROBBER CHOOSE VICTIM
+                elif game.phase=="rob_choose":
+                    for vid,rct in game.rob_buttons:
+                        if rct.collidepoint(mx,my):
+                            game.rob_transfer(vid)
+                            break
+
+            # build roads on right-click
+            if ev.type==pygame.MOUSEBUTTONDOWN and ev.button==3 and game.phase=="regular":
+                if hover_edge and game.can_build_road():
+                    rid = game.edge_id(hover_edge)
+                    # must connect to your network
+                    valid=False
+                    # adjacent to your houses:
+                    for hid in game.current_player.houses:
+                        tid,loc=divmod(hid-1,12)
+                        cor = loc if loc<6 else loc-6
+                        if game.tile_nodes[tid][cor] in hover_edge:
+                            valid=True
+                    # or adjacent to your roads
+                    if not valid:
+                        for orid in game.current_player.roads:
+                            otid,oi = divmod(orid-1,6)
+                            if game.tile_edges[otid][oi] == hover_edge:
+                                valid=True
+                    if valid:
+                        # pay
+                        game.current_player.resources["clay"]-=1
+                        game.current_player.resources["wood"]-=1
+                        game.current_player.roads.append(rid)
+
+        # ─────────────────────────────────────────────────────────────────────
+        # DRAWING
+        screen.fill((30,30,30))
+
+        # draw hexes
+        dice_tot = sum(game.dice_result) if game.dice_result else None
+        for r,row in enumerate(game.board):
+            for c,tile in enumerate(row):
+                hl = (tile[1]==dice_tot and tile[0]!="desert")
+                draw_hex(tile, game.centers[r][c], hl)
+
+        # draw ports on nodes
+        draw_ports(game.ports)
+
+        # draw hit-boxes
+        if game.phase=="setup":
+            if game.current_act=="settlement":
+                for node in game.valid_nodes:
+                    if game.is_valid_settlement(node):
+                        draw_hitbox_node(node)
+            elif game.current_act=="road":
+                # only edges adjacent to last settlement
+                last_hid = game.current_player.houses[-1]
+                tid,loc=divmod(last_hid-1,12); cor=loc if loc<6 else loc-6
+                base_node = game.tile_nodes[tid][cor]
+                for e in game.valid_edges:
+                    if base_node in e:
+                        draw_hitbox_edge(e)
+
+        elif game.phase=="regular":
+            # settlement spots
+            if game.can_build_settlement():
+                for node in game.valid_nodes:
+                    if game.is_valid_settlement(node):
+                        draw_hitbox_node(node)
+            # road spots
+            if game.can_build_road():
+                for e in game.valid_edges:
+                    # connected to your network
+                    mid_valid=False
+                    for hid in game.current_player.houses:
+                        tid,loc=divmod(hid-1,12); cor=loc if loc<6 else loc-6
+                        if game.tile_nodes[tid][cor] in e:
+                            mid_valid=True
+                    for orid in game.current_player.roads:
+                        otid,oi = divmod(orid-1,6)
+                        if game.tile_edges[otid][oi] in e:
+                            mid_valid=True
+                    if mid_valid:
+                        draw_hitbox_edge(e)
+
+        # draw existing roads
+        for p in game.players:
+            for rid in p.roads:
+                tid,i = divmod(rid-1,6)
+                draw_road(game.tile_edges[tid][i], p.color)
+
+        # draw settlements & cities
+        for p in game.players:
+            for hid in p.houses:
+                tid,loc=divmod(hid-1,12)
+                lvl = 1 if loc<6 else 2
+                cor = loc if loc<6 else loc-6
+                draw_settlement(game.tile_nodes[tid][cor], lvl, p.color)
+
+        # draw robber
+        rb_flat = game.robber
+        rr, rc = game.flat_to_rc[rb_flat]
+        center = game.centers[rr][rc]
+        draw_robber(center)
+
+        # draw UI overlays
+        draw_ui(game)
 
         pygame.display.flip()
+        clock.tick(60)
 
 if __name__ == "__main__":
     main()
