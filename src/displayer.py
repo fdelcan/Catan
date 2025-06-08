@@ -1,211 +1,167 @@
-# Displayer.py
 import sys, os, math, random
 import pygame, pygame.gfxdraw
+import structure
 
-# ─── Configuration constants ─────────────────────────────────────────────────
-BASE_SIZE          = 70     # base hexagon size in world units
-HOUSE_SIZE_FACTOR  = 1/8    # house size = BASE_SIZE * this * scale
-ROAD_WIDTH_FACTOR  = 0.15   # road width = BASE_SIZE * this * scale
-NODE_RADIUS_FACTOR = 0.10   # node radius factor
+# ─────────────────────────────────────────────────────────────────────────────
+# Constants and Options
+SIZE = 70
+NODE_RADIUS = SIZE * 0.10
+PRINT_NODES = False  # Toggle printing and drawing of node names
 
-# Mapping resource codes to names for display colors
+# Mapping for resources
 RESOURCE_NAMES = {
-    0: "desert",
-    1: "rock",
-    2: "wood",
-    3: "sheep",
-    4: "wheat",
-    5: "clay",
+    structure.DESERT:   'desert',
+    structure.MOUNTAIN: 'rock',
+    structure.FOREST:   'wood',
+    structure.PASTURE:  'sheep',
+    structure.FIELD:    'wheat',
+    structure.BRICK:    'clay',
 }
-RESOURCE_COLORS = {
-    "sheep":  (200,255,200),
-    "wheat":  (255,240,150),
-    "clay":   (220, 92, 92),
-    "wood":   (139, 69, 19),
-    "rock":   (160,160,160),
-    "desert": (238,214,175),
+COLOR_MAP = {
+    'sheep':  (200,255,200),
+    'wheat':  (255,240,150),
+    'clay':   (205, 92, 92),
+    'wood':   (139, 69, 19),
+    'rock':   (160,160,160),
+    'desert': (238,214,175),
 }
-PLAYER_COLORS = ["red","blue","green","orange"]
+PLAYER_COLOR = {
+    structure.player_Red:   'red',
+    structure.player_Blue:  'blue',
+    structure.player_Yellow:'yellow',
+    structure.player_White: 'white'
+}
 
-# ─── Pan & Zoom state ─────────────────────────────────────────────────────────
-pan_x = 0.0
-pan_y = 0.0
-scale = 1.0
-default_scale = 1.0
-
-# ─── Pygame initialization ────────────────────────────────────────────────────
+# Pygame init
 os.environ['SDL_VIDEO_WINDOW_POS'] = '0,0'
 pygame.init()
 WIDTH, HEIGHT = 900, 650
 screen = pygame.display.set_mode((WIDTH, HEIGHT))
-pygame.display.set_caption("Catan")
+pygame.display.set_caption("Catan Viewer")
 font = pygame.font.SysFont("Arial", 20)
 
-# ─── Helper transforms ─────────────────────────────────────────────────────────
-def world_to_screen(x, y):
-    """Convert world coords to screen coords, applying pan & zoom."""
-    sx = WIDTH/2  + (x + pan_x) * scale
-    sy = HEIGHT/2 + (y + pan_y) * scale
-    return int(sx), int(sy)
+# Camera
+class Camera:
+    def __init__(self):
+        self.offset = pygame.Vector2(0,0)
+        self.scale = 1.0
+    def world_to_screen(self, x, y):
+        return (
+            int(x*self.scale + WIDTH/2 + self.offset.x),
+            int(y*self.scale + HEIGHT/2 + self.offset.y)
+        )
+    def screen_to_world(self, sx, sy):
+        return (
+            (sx - WIDTH/2 - self.offset.x)/self.scale,
+            (sy - HEIGHT/2 - self.offset.y)/self.scale
+        )
 
-# Precompute board tile centers in world coords
-def board_positions():
+# Board layout
+def board_positions(size):
     rows = [3,4,5,4,3]
-    v = BASE_SIZE * 1.5
-    h = BASE_SIZE * math.sqrt(3)
-    y0 = -2 * v
-    pts = []
-    for r, cnt in enumerate(rows):
-        y = y0 + r * v
-        x0 = -h * (cnt - 1) / 2
-        for i in range(cnt):
-            pts.append((x0 + i * h, y))
-    return pts
+    v = size*1.5; h = size*math.sqrt(3)
+    y0 = -2*v
+    pts=[]
+    for r,cnt in enumerate(rows):
+        y=y0+r*v; x0=-h*(cnt-1)/2
+        for i in range(cnt): pts.append((x0+i*h,y))
+    return pts, rows
 
-# Generate hexagon vertices in world coords
-def hexagon_vertices(cx, cy):
-    size = BASE_SIZE * 0.95
+def hexagon_vertices(cx, cy, size):
     return [
-        (cx + size * math.cos(math.radians(60*i - 30)),
-         cy + size * math.sin(math.radians(60*i - 30)))
-        for i in range(6)
+        (
+            cx + size*math.cos(math.radians(60*i - 30)),
+            cy + size*math.sin(math.radians(60*i - 30))
+        ) for i in range(6)
     ]
 
-# ─── Drawing primitives ───────────────────────────────────────────────────────
-def draw_hex(res_num, center, highlight=False):
-    res, num = res_num
-    name = RESOURCE_NAMES.get(res, "desert")
-    col  = RESOURCE_COLORS[name]
-    verts = hexagon_vertices(*center)
-    pts = [world_to_screen(x, y) for x, y in verts]
-    pygame.gfxdraw.filled_polygon(screen, pts, col)
-    pygame.gfxdraw.aapolygon(screen, pts, (0,0,0))
-    if num:
-        txt = font.render(str(num), True, (255,0,0) if highlight else (0,0,0))
-        sx, sy = world_to_screen(*center)
-        screen.blit(txt, (sx - txt.get_width()/2,
-                          sy - txt.get_height()/2))
+# Precompute tile geometry
+tile_pts, tile_rows = board_positions(SIZE)
+flat_to_rc = {}
+centers = []
+idx=0
+for r,cnt in enumerate(tile_rows):
+    row=[]
+    for c in range(cnt):
+        row.append(tile_pts[idx])
+        flat_to_rc[idx]=(r,c)
+        idx+=1
+    centers.append(row)
+# tile_vertices[flat_index] = list of 6 world coords
+tile_vertices = [hexagon_vertices(cx,cy,SIZE) for r in range(len(tile_rows)) for cx,cy in [centers[r][c] for c in range(len(centers[r]))]]
 
+# Build world pos for each node (r,c) in gamestate using tile_to_nodes
+def build_node_worlds(gs):
+    node_world = {}
+    for flat, corners in gs.tile_to_nodes.items():
+        verts = tile_vertices[flat]
+        for i,(nr,nc) in enumerate(corners):
+            if (nr,nc) not in node_world:
+                node_world[(nr,nc)] = verts[i]
+    return node_world
 
-def draw_settlement(node_pos, level, color):
-    sx, sy = world_to_screen(*node_pos)
-    sz = int(BASE_SIZE * HOUSE_SIZE_FACTOR * scale)
-    pygame.draw.rect(screen,
-                     pygame.Color(color),
-                     (sx-sz, sy-sz, 2*sz, 2*sz))
-    if level==2:
-        pygame.draw.circle(screen,
-                           (255,255,0),
-                           (sx,sy),
-                           sz//2)
+# Draw functions
 
+def draw_hex(flat_idx, gs, camera):
+    enum, num = map(int, gs.tiles[flat_idx])
+    name = RESOURCE_NAMES[enum]
+    col = COLOR_MAP[name]
+    cx,cy = centers[flat_to_rc[flat_idx][0]][flat_to_rc[flat_idx][1]]
+    pts = hexagon_vertices(cx,cy,SIZE*0.95)
+    spts=[camera.world_to_screen(x,y) for x,y in pts]
+    pygame.gfxdraw.filled_polygon(screen,spts,col)
+    pygame.gfxdraw.aapolygon(screen,spts,(0,0,0))
+    if num>0:
+        sx,sy = camera.world_to_screen(cx,cy)
+        txt=font.render(str(num),True,(0,0,0))
+        screen.blit(txt,(sx-txt.get_width()//2, sy-txt.get_height()//2))
 
-def draw_road(edge_pts, color):
-    width = max(1, int(BASE_SIZE * ROAD_WIDTH_FACTOR * scale))
-    p1 = world_to_screen(*edge_pts[0])
-    p2 = world_to_screen(*edge_pts[1])
-    pygame.draw.line(screen,
-                     pygame.Color(color),
-                     p1, p2,
-                     width)
+# Plot GameState
+def draw_gs(gs, screen, camera):
+    # draw tiles
+    for flat in range(len(tile_vertices)):
+        draw_hex(flat, gs, camera)
+    # build node positions
+    node_world = build_node_worlds(gs)
+    # draw nodes labels
+    if PRINT_NODES:
+        for (nr,nc),pos in node_world.items():
+            sx,sy = camera.world_to_screen(*pos)
+            lbl = f"{nr},{nc}"
+            txt=font.render(lbl,True,(255,255,255))
+            screen.blit(txt,(sx-txt.get_width()//2, sy-txt.get_height()//2))
+    # draw houses/cities
+    for (nr,nc), (player,count) in {(nr,nc):tuple(gs.nodes[nr][nc]) for nr in range(len(gs.nodes)) for nc in range(gs.nodes[nr].shape[0])}.items():
+        if player>0:
+            x,y = node_world[(nr,nc)]
+            sx,sy = camera.world_to_screen(x,y)
+            color = pygame.Color(PLAYER_COLOR[player])
+            size = int(NODE_RADIUS*camera.scale* (2 if count>1 else 1))
+            pygame.draw.rect(screen,color,(sx-size,sy-size,2*size,2*size))
+    # draw roads
+    for (pa,pb),player in gs.edges.items():
+        if player>0:
+            x1,y1 = node_world[pa]; x2,y2 = node_world[pb]
+            sx1,sy1 = camera.world_to_screen(x1,y1)
+            sx2,sy2 = camera.world_to_screen(x2,y2)
+            pygame.draw.line(screen,pygame.Color(PLAYER_COLOR[player]),(sx1,sy1),(sx2,sy2), int(NODE_RADIUS*camera.scale))
 
-
-def draw_robber(center):
-    sx, sy = world_to_screen(*center)
-    diameter = int(BASE_SIZE * scale)
-    surf = pygame.Surface((diameter, diameter), pygame.SRCALPHA)
-    pygame.draw.circle(surf,
-                       (0,0,0,90),
-                       (diameter//3, diameter//3),
-                       diameter//3)
-    screen.blit(surf, (sx-diameter//3, sy-diameter//3))
-
-
-def draw_ui(game):
-    # Turn indicator
-    col = PLAYER_COLORS[game.current_player]
-    txt = font.render(f"Turn: {col}", True, (255,255,255))
-    screen.blit(txt, (10,10))
-    # Resource counts
-    x, y = 10, HEIGHT - 40
-    for rcode in range(6):
-        name = RESOURCE_NAMES.get(rcode, "desert")
-        bgcol = RESOURCE_COLORS[name]
-        cnt = game.cards[game.current_player, rcode]
-        lbl = font.render(str(cnt), True, (0,0,0))
-        w, h = lbl.get_width()+6, lbl.get_height()+4
-        bg = pygame.Surface((w,h))
-        bg.fill(bgcol)
-        screen.blit(bg, (x,y))
-        screen.blit(lbl, (x+3, y+2))
-        x += w + 6
-
-# ─── Frame drawing ────────────────────────────────────────────────────────────
-def draw_frame(game):
-    screen.fill((30,30,30))
-    centers = board_positions()
-    # map node coords
-    rc_to_coord = {}
-    for tid, center in enumerate(centers):
-        verts = hexagon_vertices(*center)
-        for i, rc in enumerate(game.tile_to_nodes[tid]):
-            rc_to_coord[tuple(rc)] = verts[i]
-    # highlight dice
-    dice_total = sum(game.dice_result) if getattr(game, 'dice_result', None) else None
-    # tiles
-    for tid, pair in enumerate(game.tiles):
-        draw_hex(pair, centers[tid], highlight=(pair[1]==dice_total))
-    # roads
-    for (rc1, rc2), col in game.edges.items():
-        p1 = rc_to_coord[tuple(rc1)]; p2 = rc_to_coord[tuple(rc2)]
-        draw_road((p1,p2), PLAYER_COLORS[col-1])
-    # settlements
-    for r, row in enumerate(game.nodes):
-        for c, (pl, lvl) in enumerate(row):
-            if pl>0:
-                draw_settlement(rc_to_coord[(r,c)], lvl, PLAYER_COLORS[pl-1])
-    # robber
-    rob = game.robber
-    rows = [3,4,5,4,3]
-    if isinstance(rob, tuple): flat = sum(rows[:rob[0]]) + rob[1]
-    else: flat = rob
-    center = centers[int(flat)]
-    draw_robber(center)
-    # UI
-    draw_ui(game)
-    pygame.display.flip()
-
-# ─── Public display function ──────────────────────────────────────────────────
-def display(game):
-    """
-    Opens a window and lets you pan/zoom the Catan board interactively.
-    Call this once with your GameState; it will run until you close the window.
-    """
-    global pan_x, pan_y, scale
-    dragging = False
-    last_mouse = (0,0)
-    clock = pygame.time.Clock()
+# Main loop
+if __name__=='__main__':
+    clock=pygame.time.Clock()
+    camera=Camera()
+    gs=structure.generate_game()
     while True:
         for ev in pygame.event.get():
-            if ev.type == pygame.QUIT:
-                return
-            elif ev.type == pygame.MOUSEBUTTONDOWN:
-                if ev.button == 1:
-                    dragging = True; last_mouse = ev.pos
-                elif ev.button == 2:
-                    pan_x = pan_y = 0.0; scale = default_scale
-            elif ev.type == pygame.MOUSEBUTTONUP:
-                if ev.button == 1:
-                    dragging = False
-            elif ev.type == pygame.MOUSEMOTION:
-                if dragging:
-                    dx = ev.pos[0] - last_mouse[0]
-                    dy = ev.pos[1] - last_mouse[1]
-                    pan_x += dx / scale
-                    pan_y += dy / scale
-                    last_mouse = ev.pos
-            elif ev.type == pygame.MOUSEWHEEL:
-                factor = 1.1 ** ev.y
-                scale *= factor
-        draw_frame(game)
-        clock.tick(60)
+            if ev.type==pygame.QUIT:
+                pygame.quit(); sys.exit()
+            if ev.type==pygame.MOUSEBUTTONDOWN:
+                if ev.button==1: last=pygame.Vector2(ev.pos)
+                elif ev.button==2: camera=Camera()
+                elif ev.button==4: camera.scale*=1.1
+                elif ev.button==5: camera.scale/=1.1
+            if ev.type==pygame.MOUSEMOTION and ev.buttons[0]:
+                m=pygame.Vector2(ev.pos); camera.offset+=m-last; last=m
+        screen.fill((30,30,30))
+        draw_gs(gs,screen,camera)
+        pygame.display.flip(); clock.tick(60)

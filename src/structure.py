@@ -25,12 +25,14 @@ class GameState:
         self.robber = (0, 0)  # Robber position on the board
         self.current_player = 0  # Index of the current player
         self._map_tiles_to_node_indices()
-
+        self.harbors = {}  # key: (x,y), value: resource type (int)
+        self.better_trades = {}  # key: (player), value: resource type (int), 0 for general 3:1 trade.
+        
     def add_edge(self, point_A, point_B, color):
         # Order points unambiguously
         ordered_edge = tuple(sorted([point_A, point_B]))
         self.edges[ordered_edge] = color
-
+        
     def has_edge(self, point_A, point_B):
         ordered_edge = tuple(sorted([point_A, point_B]))
         return self.edges.get(ordered_edge, False)
@@ -87,6 +89,34 @@ class GameState:
                     # player indices are 1…N, convert to 0-based
                     self.cards[player-1, resource_type] += count
                     
+                    
+    def initialize_harbors(self):
+        """
+        Initialize the harbors on the board.
+        This is a placeholder function, you can define specific harbors as needed.
+        """
+        list_nodes = [[(1, 0), (0, 0), (1, 1), (0, 1), (1, 2)],
+                      [(0, 2), (1, 3), (2, 3), (3, 4), (4, 4)],
+                      [(5, 5), (6, 5), (7, 4), (8, 4), (9, 3)],
+                      [(10,3), (11,2), (10,2), (11,1), (10,1)],
+                      [(11,0), (10,0), (9 ,0), (8 ,0), (7 ,0)],
+                      [(6 ,0), (5 ,0), (4 ,0), (3 ,0), (2 ,0)]
+                      ]
+        
+        harbors = [0, MOUNTAIN, FOREST, PASTURE, FIELD, BRICK]
+        np.random.shuffle(harbors)
+        for i in range(len(harbors)):
+            if harbors[i] == 0 or harbors[i] == MOUNTAIN or harbors[i] == FOREST:
+                self.harbors[list_nodes[i][2]] = harbors[i]
+                self.harbors[list_nodes[i][3]] = harbors[i]
+            else:
+                self.harbors[list_nodes[i][0]] = 0  # General 3:1 trade
+                self.harbors[list_nodes[i][1]] = 0  # General 3:1 trade
+                self.harbors[list_nodes[i][3]] = harbors[i]
+                self.harbors[list_nodes[i][4]] = harbors[i]
+                
+                
+                    
     def initialize_random_board(self):
         """
         Initialize the tiles with a random configuration.
@@ -106,6 +136,7 @@ class GameState:
                 self.tiles[i, 1] = numbers[i - desert]
             
         self.current_player = np.random.randint(0, self.number_players)
+        self.initialize_harbors()
             
 
 def generate_game():
